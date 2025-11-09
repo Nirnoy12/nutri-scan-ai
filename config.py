@@ -29,6 +29,8 @@ class Config:
     # --- THIS IS THE FIX ---
     # It will now be 'None' if the key is not in the .env file
     HF_TOKEN = os.environ.get('HF_TOKEN') 
+
+    GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
     
     # App-specific
-    UPLOAD_FOLDER = 'static/uploads'
+    UPLOAD_FOLDER = 'public/uploads'

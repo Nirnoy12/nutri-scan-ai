@@ -47,7 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (globalError && globalErrorText) {
             globalErrorText.textContent = message;
             globalError.style.display = 'flex';
-        } else {
+        } else {    
             alert(message); // Fallback
         }
     }
@@ -299,7 +299,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- NEW: Function to share a history item ---
     async function shareHistoryItem(filename, verdict) {
-        const imageUrl = `${window.location.origin}/static/uploads/${filename}`;
+       const imageUrl = `${window.location.origin}${filename}`;
         
         try {
             // 1. Fetch the image and convert it to a blob
@@ -360,7 +360,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Image
         const img = document.createElement('img');
-        img.src = `static/uploads/${scanData.filename}`;
+        img.src = scanData.filename;
         img.alt = `Scan from ${scanData.timestamp}`;
 
         // Info (Verdict + Timestamp)

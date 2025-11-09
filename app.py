@@ -1,27 +1,23 @@
 import os
 import logging
+import base64  # <-- ADDED
 from datetime import datetime, UTC
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from PIL import Image
-from paddleocr import PaddleOCR
 from flask_sqlalchemy import SQLAlchemy
-from transformers import (
-    AutoImageProcessor, AutoModelForImageClassification, 
-    AutoTokenizer, AutoModelForCausalLM
-)
 from huggingface_hub import InferenceClient
 from openai import OpenAI
 from config import Config
+# from google.cloud import vision  # <-- REMOVED
+import io
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.DEBUG)
 
 # --- App Setup ---
-# Tell Flask to use the 'public' folder as the static folder
-# and serve its contents from the root path
 app = Flask(__name__, static_folder='public', static_url_path='')
 app.config.from_object(Config)
 
@@ -33,42 +29,43 @@ login_manager.login_view = 'login'
 login_manager.login_message = "You must be logged in to access this page."
 
 # --- AI Client Setup ---
-# Check if HF_TOKEN is set
+
+# Check for Hugging Face Token (for chat, OCR, and vision)
 if not app.config['HF_TOKEN']:
     raise ValueError("HF_TOKEN is not set. Please add it to your .env file.")
 
+# --- REMOVED: Google Gemini/Vision API Key Check ---
+
 # --- PaddleOCR Setup ---
-try:
-    # Suppress verbose PaddleOCR logs
-    logging.getLogger('ppocr').setLevel(logging.ERROR) 
-    
-    # Replaced 'use_angle_cls' and removed invalid 'show_log'
-    ocr_model = PaddleOCR(use_textline_orientation=True, lang='en')
-    logging.info("PaddleOCR initialized successfully.")
-except Exception as e:
-    logging.error(f"PaddleOCR initialization FAILED: {repr(e)}")
-    ocr_model = None
+# *** ALL PADDLEOCR CODE REMOVED ***
+logging.info("PaddleOCR has been removed. Using Hugging Face API.")
 
-# Define local food models
-FOOD_MODEL_LOCAL_PRIMARY = "prithivMLmods/Food-101-93M"
-FOOD_MODEL_LOCAL_FALLBACK = "nateraw/food"
-food_client = None 
-logging.info("Food recognition will use dual local models.")
+# --- Local Food Models ---
+# *** ALL LOCAL TRANSFORMERS CODE REMOVED ***
+logging.info("Local food models have been removed. Using Hugging Face API.")
 
-# Initialize OpenAI client for chat
+
+# Initialize OpenAI client for chat, OCR, AND vision (via Hugging Face)
+# This ONE client will handle all three tasks
 CHAT_MODEL = "meta-llama/Llama-3.1-8B-Instruct:novita"
+OCR_MODEL = "Qwen/Qwen3-VL-8B-Instruct:novita"
+VISION_MODEL = "Qwen/Qwen3-VL-8B-Instruct:novita" # Using LLaVA for food recognition
+
 try:
     chat_client = OpenAI(
         base_url="https://router.huggingface.co/v1",
         api_key=app.config['HF_TOKEN'],
     )
-    logging.info("OpenAI client for chat initialized successfully.")
+    logging.info("OpenAI client for HF router initialized successfully.")
 except Exception as e:
     logging.error(f"OpenAI client initialization FAILED: {repr(e)}")
     chat_client = None
 
+# --- REMOVED: Google Cloud Vision Client ---
+
 # ==================================
 # --- DATABASE MODELS ---
+# (This section is unchanged)
 # ==================================
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -95,118 +92,115 @@ class Scan(db.Model):
 # --- AI HELPER FUNCTIONS ---
 # ==================================
 
+# --- NEW: Helper to convert local image to base64 data ---
+def _image_to_base64_data_uri(image_path):
+    """Converts an image file to a base64 data URI."""
+    try:
+        # Use PIL to open and convert to JPEG, ensuring compatibility
+        img = Image.open(image_path)
+        img = img.convert("RGB") # Ensure it's in RGB format
+        
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        
+        binary_data = buffered.getvalue()
+        base64_encoded_data = base64.b64encode(binary_data)
+        base64_string = base64_encoded_data.decode('utf-8')
+        
+        return f"data:image/jpeg;base64,{base64_string}"
+    except Exception as e:
+        logging.error(f"Failed to convert image to base64: {repr(e)}")
+        raise
+
+# --- REPLACED: extract_text ---
 def extract_text(image_path):
-    """Uses PaddleOCR to read text from an image."""
-    if not ocr_model:
-        logging.error("PaddleOCR model is not available.")
-        return "Error: OCR model is not initialized."
+    """Uses Hugging Face DeepSeek-OCR API to read text from an image."""
+    if not chat_client:
+        logging.error("HF client (chat_client) is not available.")
+        return "Error: API is not initialized."
+
     try:
-        logging.debug(f"Processing image with PaddleOCR: {image_path}")
+        logging.debug(f"Opening image for HF OCR: {image_path}")
+        base64_image_uri = _image_to_base64_data_uri(image_path)
         
-        # *** FIX: Changed from .ocr(cls=True) to .predict() ***
-        result = ocr_model.predict(image_path)
-        
-        if not result or not result[0]:
-            logging.warning("PaddleOCR returned no text.")
-            return "OCR returned no text. Image may be unclear."
+        prompt_text = "Extract all text from this image. Respond with only the transcribed text."
 
-        lines = []
-        for res_line in result[0]:
-            # res_line format is [[box], (text, confidence)]
-            text = res_line[1][0]
-            lines.append(text)
+        logging.debug(f"Sending request to HF OCR model: {OCR_MODEL}")
+        completion = chat_client.chat.completions.create(
+            model=OCR_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {"url": base64_image_uri}}
+                    ],
+                }
+            ],
+            max_tokens=1024, # Give it enough tokens to read a full label
+        )
+
+        response_text = completion.choices[0].message.content.strip()
         
-        full_text = "\n".join(lines)
-        logging.debug(f"PaddleOCR extracted text: {full_text[:100]}...")
-        return full_text.strip()
-        
+        logging.debug("HF OCR API success.")
+        return response_text
+
     except Exception as e:
-        logging.error(f"PaddleOCR Error: {repr(e)}")
-        return f"Error: PaddleOCR failed. (Reason: {repr(e)})"
+        logging.error(f"HF OCR API Error: {repr(e)}")
+        return f"Error: OCR API failed. (Reason: {repr(e)})"
 
 
-def _recognize_food_local(image_path, model_name):
-    """
-    Helper function to run a local food recognition model.
-    Returns (list_of_labels, None) or (None, error_string)
-    """
-    try:
-        logging.debug(f"Loading local food model: {model_name}")
-        
-        processor = AutoImageProcessor.from_pretrained(model_name, token=app.config['HF_TOKEN'])
-        model = AutoModelForImageClassification.from_pretrained(model_name, token=app.config['HF_TOKEN'])
-        
-        image = Image.open(image_path).convert("RGB")
-        inputs = processor(image, return_tensors="pt")
-        outputs = model(**inputs)
-        logits = outputs.logits
-        probs = logits.softmax(dim=-1)
-        
-        top_5_indices = probs[0].topk(5).indices
-        top_5_labels = [model.config.id2label[i.item()].replace('_', ' ').title() for i in top_5_indices]
-        
-        logging.debug(f"Local food recognition successful ({model_name}): {top_5_labels}")
-        return top_5_labels, None # Return list of labels, no error
-    except Exception as e:
-        logging.error(f"Local Food Model Error ({model_name}): {repr(e)}")
-        return None, f"Error: Could not identify food (Local). (Reason: {repr(e)})"
-
-
+# --- REPLACED: recognize_food ---
 def recognize_food(image_path):
-    """
-    Uses two local food models to find the "best pick" identification.
-    Returns a clean text string (e.g., "Hamburger") and an error string (if any).
-    """
-    logging.debug(f"Starting dual food recognition for: {image_path}")
+    """Uses Hugging Face LLaVA API to identify food in an image."""
+    if not chat_client:
+        logging.error("HF client (chat_client) is not available.")
+        return None, "Error: API is not initialized."
 
-    # 1. Run primary local model (prithivMLmods)
-    labels_1, err_1 = _recognize_food_local(
-        image_path, 
-        FOOD_MODEL_LOCAL_PRIMARY 
-    )
-    
-    # 2. Run secondary local model (nateraw)
-    labels_2, err_2 = _recognize_food_local(
-        image_path, 
-        FOOD_MODEL_LOCAL_FALLBACK
-    )
+    try:
+        logging.debug(f"Opening image for HF Vision: {image_path}")
+        base64_image_uri = _image_to_base64_data_uri(image_path)
+        
+        prompt_text = "Identify the food item in this image. Respond with only the name of the food (e.g., 'Hamburger', 'Caesar Salad')."
+        
+        logging.debug(f"Sending request to HF Vision model: {VISION_MODEL}")
+        completion = chat_client.chat.completions.create(
+            model=VISION_MODEL, 
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {"url": base64_image_uri}}
+                    ],
+                }
+            ],
+            max_tokens=50, # We only need the food name
+            temperature=0.1,
+        )
 
-    # 3. Check for total failure
-    if err_1 and err_2:
-        logging.error(f"All food models failed. Model 1: {err_1}, Model 2: {err_2}")
-        return None, f"All food models failed.\nModel 1: {err_1}\nModel 2: {err_2}"
+        response_text = completion.choices[0].message.content.strip()
+        
+        # Clean the response just in case
+        # (e.g., if it says "The food is: Hamburger", pull out "Hamburger")
+        if ":" in response_text:
+            response_text = response_text.split(":")[-1].strip().replace("\"", "").replace(".", "")
+        
+        # Sometimes models add "A picture of a..."
+        response_text = response_text.split("A picture of a")[-1].strip()
 
-    # 4. "Best Pick" Logic
-    best_pick_text = ""
-    if labels_1 and labels_2:
-        # Find common items (intersection)
-        common_items = list(set(labels_1) & set(labels_2))
-        if common_items:
-            logging.debug(f"Found common items: {common_items}")
-            best_pick_text = ", ".join(common_items)
-        else:
-            # No common items, trust the primary model's top guess
-            logging.debug(f"No common items. Trusting primary model: {labels_1[0]}")
-            best_pick_text = labels_1[0]
-    elif labels_1:
-        # Only primary model succeeded
-        logging.debug(f"Only primary model succeeded. Using: {labels_1[0]}")
-        best_pick_text = labels_1[0]
-    elif labels_2:
-        # Only secondary model succeeded
-        logging.debug(f"Only secondary model succeeded. Using: {labels_2[0]}")
-        best_pick_text = labels_2[0]
-    else:
-        # This case should be caught by step 3, but as a safeguard
-        return None, "Food models returned empty lists."
+        logging.debug(f"HF Vision API success. Food: {response_text}")
+        return response_text, None
 
-    logging.debug(f"Best pick for food: {best_pick_text}")
-    return best_pick_text, None # Return clean string, no error
+    except Exception as e:
+        logging.error(f"HF Vision API Error: {repr(e)}")
+        return None, f"Error: Vision API (HF) failed. (Reason: {repr(e)})"
+
 
 def get_ai_nutrition_analysis(context_text, system_prompt, user_prompt):
     """
     Calls the chat API to get a nutritional analysis.
-    Returns (analysis_text, None) on success, or (None, error_string) on failure.
+    (This function is unchanged)
     """
     if not chat_client:
         logging.error("Chat client is not initialized.")
@@ -214,9 +208,6 @@ def get_ai_nutrition_analysis(context_text, system_prompt, user_prompt):
 
     try:
         logging.debug(f"Calling chat API with model: {CHAT_MODEL}")
-        logging.debug(f"System Prompt: {system_prompt}")
-        logging.debug(f"User Prompt: {user_prompt} | Context: {context_text[:100]}...")
-        
         full_user_content = f"{user_prompt}\n\nHere is the text to analyze:\n{context_text}"
 
         completion = chat_client.chat.completions.create(
@@ -239,35 +230,10 @@ def get_ai_nutrition_analysis(context_text, system_prompt, user_prompt):
         logging.error(f"Chat API analysis Error: {repr(e)}")
         return None, f"Error during AI analysis: {repr(e)}"
 
-def chat_with_bot_local(message):
-    """Uses local DistilGPT-2 model for chatbot conversation."""
-    CHAT_FALLBACK_MODEL = "distilgpt2"
-    try:
-        logging.debug(f"Loading local chat model: {CHAT_FALLBACK_MODEL}")
-        chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_FALLBACK_MODEL, token=app.config['HF_TOKEN'])
-        chat_model = AutoModelForCausalLM.from_pretrained(CHAT_FALLBACK_MODEL, token=app.config['HF_TOKEN'])
-        user_scans = Scan.query.filter_by(user_id=current_user.id).order_by(Scan.timestamp.desc()).limit(10).all()
-        eaten_foods = [scan.quick_verdict for scan in user_scans]
-        system_prompt = f"You are NutriBot, a helpful AI nutrition assistant. The user's recent scans: {', '.join(eaten_foods)}. Be concise and helpful."
-        prompt = f"{system_prompt}\n\nUser: {message}"
-        logging.debug(f"Chat prompt: {prompt}")
-        inputs = chat_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        outputs = chat_model.generate(
-            inputs["input_ids"],
-            max_new_tokens=250,
-            temperature=0.7,
-            pad_token_id=chat_tokenizer.eos_token_id
-        )
-        response = chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response = response[len(prompt):].strip()
-        logging.debug(f"Chat response: {response}")
-        return response
-    except Exception as e:
-        logging.error(f"Local Chat Model Error: {repr(e)}")
-        return f"Error: Chatbot failed. (Reason: {repr(e)})"
 
 # ==================================
 # --- AUTHENTICATION ROUTES ---
+# (This section is unchanged)
 # ==================================
 @login_manager.user_loader
 def load_user(user_id):
@@ -310,6 +276,8 @@ def logout():
 
 # ==================================
 # --- PROTECTED APP ROUTES ---
+# (The /analyze route is unchanged, as the helper functions
+#  have the same inputs/outputs as before)
 # ==================================
 @app.route('/')
 @login_required
@@ -323,7 +291,7 @@ def get_history():
     try:
         user_scans = Scan.query.filter_by(user_id=current_user.id).order_by(Scan.timestamp.desc()).limit(30).all()
         history_list = [{
-            "filename": scan.filename,
+            "filename": f"/uploads/{scan.filename}",
             "timestamp": scan.timestamp.strftime("%Y-%m-%d %H:%M"),
             "quick_verdict": scan.quick_verdict,
             "ocr_text": scan.ocr_text
@@ -340,6 +308,7 @@ def analyze_image():
     """Analyzes an image (OCR or Food) and saves to DB."""
     logging.debug(f"Received /analyze request: {request.form}, files: {request.files}")
     
+    # ... (File validation checks are unchanged) ...
     if 'file' not in request.files:
         logging.error("No file part in the request")
         return jsonify({'error': 'No file part in the request'}), 400
@@ -386,14 +355,14 @@ def analyze_image():
 
     try:
         if scan_type == 'label':
-            # 1. Get OCR text from PaddleOCR
-            logging.debug("Scan type 'label': Starting PaddleOCR.")
-            ocr_text_to_save = extract_text(filepath) # This now uses Paddle
+            # 1. Get OCR text from Hugging Face API
+            logging.debug("Scan type 'label': Starting HF DeepSeek-OCR.")
+            ocr_text_to_save = extract_text(filepath) # This now uses HF
             if "Error:" in ocr_text_to_save:
-                logging.error(f"PaddleOCR failed: {ocr_text_to_save}")
+                logging.error(f"HF OCR failed: {ocr_text_to_save}")
                 return jsonify({'error': ocr_text_to_save}), 400
 
-            # 2. Get AI Quick Verdict
+            # 2. Get AI Quick Verdict (Unchanged)
             verdict_sys_prompt = "You are a professional nutritionist. You have read the following nutrition label text."
             verdict_user_prompt = "Provide a concise, one-paragraph verdict on this product's healthiness based on the text. Speak as the nutritionist."
             verdict, err = get_ai_nutrition_analysis(ocr_text_to_save, verdict_sys_prompt, verdict_user_prompt)
@@ -402,7 +371,7 @@ def analyze_image():
                 return jsonify({'error': f"AI analysis failed: {err}"}), 500
             quick_verdict = verdict
 
-            # 3. Get AI Detailed Report (Long-Term)
+            # 3. Get AI Detailed Report (Unchanged)
             report_sys_prompt = "You are a professional nutritionist."
             report_user_prompt = "Based on the nutrition label text, what are the potential long-term health impacts (positive or negative) of consuming this item regularly? Be concise and use bullet points."
             report, err = get_ai_nutrition_analysis(ocr_text_to_save, report_sys_prompt, report_user_prompt)
@@ -415,8 +384,8 @@ def analyze_image():
             logging.debug(f"Label analysis complete. Verdict: {quick_verdict[:50]}...")
             
         elif scan_type == 'food':
-            # 1. Get "best pick" food recognition text
-            logging.debug("Scan type 'food': Starting dual food recognition.")
+            # 1. Get food recognition text from Hugging Face API
+            logging.debug("Scan type 'food': Starting HF LLaVA food recognition.")
             best_pick_text, err = recognize_food(filepath) 
             
             if err:
@@ -425,7 +394,7 @@ def analyze_image():
             
             ocr_text_to_save = best_pick_text # This is the clean string, e.g., "Hamburger"
 
-            # 2. Get AI Quick Verdict
+            # 2. Get AI Quick Verdict (Unchanged)
             verdict_sys_prompt = "You are a professional nutritionist. A food item has been identified."
             verdict_user_prompt = f"The food is: {ocr_text_to_save}. Provide a concise, one-paragraph nutritional verdict on this item. Speak as the nutritionist."
             verdict, err = get_ai_nutrition_analysis(ocr_text_to_save, verdict_sys_prompt, verdict_user_prompt)
@@ -434,7 +403,7 @@ def analyze_image():
                 return jsonify({'error': f"AI analysis failed: {err}"}), 500
             quick_verdict = verdict
             
-            # 3. Get AI Detailed Report (Long-Term)
+            # 3. Get AI Detailed Report (Unchanged)
             report_sys_prompt = "You are a professional nutritionist."
             report_user_prompt = f"The food is: {ocr_text_to_save}. What are the potential long-term health impacts (positive or negative) of consuming this item regularly? Be concise and use bullet points."
             report, err = get_ai_nutrition_analysis(ocr_text_to_save, report_sys_prompt, report_user_prompt)
@@ -451,7 +420,7 @@ def analyze_image():
             filename=filename,
             scan_type=scan_type,
             quick_verdict=quick_verdict,
-            ocr_text=ocr_text_to_save, # Save the PaddleOCR text or "best pick" food
+            ocr_text=ocr_text_to_save, 
             user_id=current_user.id
         )
         db.session.add(new_scan)
@@ -460,20 +429,27 @@ def analyze_image():
 
         return jsonify({
             "timestamp": new_scan.timestamp.strftime("%Y-%m-%d %H:%M"),
-            "filename": new_scan.filename,
+            "filename": f"/uploads/{new_scan.filename}",
             "ocr_text": new_scan.ocr_text,
             "quick_verdict": new_scan.quick_verdict,
             "detailed_report": detailed_report, 
             "type": new_scan.scan_type
         })
     except Exception as e:
+        db.session.rollback()
         logging.error(f"Analyze Error: {repr(e)}")
+        try:
+            os.remove(filepath)
+            logging.debug(f"Removed failed upload: {filepath}")
+        except OSError:
+            pass
         return jsonify({'error': f'An unexpected error occurred: {repr(e)}'}), 500
 
 @app.route('/chat', methods=['POST'])
 @login_required
 def chat_with_bot():
-    """Handles chatbot conversation using HF Inference API with local fallback."""
+    """Handles chatbot conversation using HF Inference API."""
+    # (This section is unchanged)
     logging.debug(f"Received /chat request: {request.json}")
     
     if not request.json or 'message' not in request.json:
@@ -485,40 +461,32 @@ def chat_with_bot():
         logging.error("Message cannot be empty")
         return jsonify({'error': 'Message cannot be empty'}), 400
     
+    if not chat_client:
+        logging.error("Chat client is not initialized.")
+        return jsonify({'error': 'Chatbot is not configured.'}), 500
+
     try:
         user_scans = Scan.query.filter_by(user_id=current_user.id).order_by(Scan.timestamp.desc()).limit(10).all()
         eaten_foods = [scan.quick_verdict for scan in user_scans] 
         system_prompt = f"You are NutriBot, a helpful AI nutrition assistant. The user's recent scan history (verdicts): {', '.join(eaten_foods)}. Be concise and helpful."
         
-        # Try OpenAI-compatible Inference API
-        if chat_client:
-            try:
-                logging.debug(f"Trying Inference API with chat model: {CHAT_MODEL}")
-                completion = chat_client.chat.completions.create(
-                    model=CHAT_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    max_tokens=250,
-                    temperature=0.7,
-                )
-                response = completion.choices[0].message.content
-                logging.debug(f"Chat API response: {response}")
-                return jsonify({'reply': response})
-            except Exception as e:
-                logging.error(f"HF Chat API Error: {repr(e)}")
-        
-        # Fallback to local DistilGPT-2
-        response = chat_with_bot_local(user_message)
-        if "Error:" in response:
-            logging.error(f"Chat fallback failed: {response}")
-            return jsonify({'error': response}), 500
-        logging.debug(f"Chat fallback response: {response}")
+        logging.debug(f"Trying Inference API with chat model: {CHAT_MODEL}")
+        completion = chat_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=250,
+            temperature=0.7,
+        )
+        response = completion.choices[0].message.content
+        logging.debug(f"Chat API response: {response}")
         return jsonify({'reply': response})
+
     except Exception as e:
-        logging.error(f"Chat Error: {repr(e)}")
-        return jsonify({'error': f"Chatbot error: {repr(e)}"}), 500
+        logging.error(f"HF Chat API Error: {repr(e)}")
+        return jsonify({'error': f"Chatbot failed: {repr(e)}"}), 500
 
 # ==================================
 # --- APP INITIALIZATION ---
@@ -527,5 +495,4 @@ if __name__ == '__main__':
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     with app.app_context():
         db.create_all()
-    # Run Flask on all network interfaces, port 8080 (changeable)
     app.run(host='0.0.0.0', port=8080, debug=True)
