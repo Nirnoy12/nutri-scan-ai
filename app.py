@@ -11,7 +11,6 @@ from flask_sqlalchemy import SQLAlchemy
 from huggingface_hub import InferenceClient
 from openai import OpenAI
 from config import Config
-# from google.cloud import vision  # <-- REMOVED
 import io
 
 # --- Logging Setup ---
