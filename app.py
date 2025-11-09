@@ -18,7 +18,7 @@ import io
 logging.basicConfig(level=logging.DEBUG)
 
 # --- App Setup ---
-app = Flask(__name__, static_folder='public', static_url_path='')
+app = Flask(__name__)
 app.config.from_object(Config)
 
 # --- Database Setup ---
