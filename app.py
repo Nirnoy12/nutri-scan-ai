@@ -20,7 +20,9 @@ from config import Config
 logging.basicConfig(level=logging.DEBUG)
 
 # --- App Setup ---
-app = Flask(__name__)
+# Tell Flask to use the 'public' folder as the static folder
+# and serve its contents from the root path
+app = Flask(__name__, static_folder='public', static_url_path='')
 app.config.from_object(Config)
 
 # --- Database Setup ---
