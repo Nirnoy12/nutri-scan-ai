@@ -22,6 +22,10 @@ app.config.from_object(Config)
 
 # --- Database Setup ---
 db = SQLAlchemy(app)
+# --- ADD THIS BLOCK TO CREATE TABLES ON STARTUP ---
+with app.app_context():
+    db.create_all()
+# -
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
